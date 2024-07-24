@@ -1,0 +1,346 @@
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from PIL import Image, ImageTk, ImageOps
+import requests
+import hashlib
+import base64
+import json
+import time
+
+class OCRTesterApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("OCR Tester")
+        self.root.geometry("1000x600")
+
+        # 初始化选中的矩形框为 None
+        self.selected_rectangle = None
+
+        # 顶部工具栏
+        toolbar = tk.Frame(root)
+        toolbar.pack(side=tk.TOP, fill=tk.X)
+
+        self.select_button = tk.Button(toolbar, text="导入", command=self.select_image)
+        self.select_button.pack(side=tk.LEFT, padx=5, pady=5)
+
+        self.analyze_button = tk.Button(toolbar, text="识别", command=self.analyze_image)
+        self.analyze_button.pack(side=tk.LEFT, padx=5, pady=5)
+
+        # 复选框始终可以勾选
+        self.show_position_var = tk.BooleanVar()
+        self.show_position_var.set(True)  # 默认勾选
+
+        self.show_position_checkbox = tk.Checkbutton(toolbar, text="显示位置", variable=self.show_position_var,
+                                                     onvalue=True, offvalue=False,
+                                                     command=self.toggle_show_position)
+        self.show_position_checkbox.pack(side=tk.LEFT, padx=5, pady=5)
+
+        # 主体部分
+        self.main_frame = tk.Frame(root)
+        self.main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 图片预览区域
+        self.preview_frame = tk.Frame(self.main_frame, bg="gray")
+        self.preview_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.preview_frame.bind("<Configure>", self.resize_image)
+        self.preview_frame.bind("<ButtonPress-1>", self.on_click_start_drag)
+        self.preview_frame.bind("<B1-Motion>", self.on_drag)
+        self.preview_frame.bind("<ButtonRelease-1>", self.on_release_drag)
+
+        self.canvas = tk.Canvas(self.preview_frame, bg="gray")
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        # 识别结果选项卡
+        self.tab_control = ttk.Notebook(self.main_frame)
+        self.tab_control.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        self.tab_raw = ttk.Frame(self.tab_control)
+        self.tab_control.add(self.tab_raw, text="原始Json")
+
+        self.tab_structured = ttk.Frame(self.tab_control)
+        self.tab_control.add(self.tab_structured, text="结构化文本")
+
+        self.result_text_raw = tk.Text(self.tab_raw, wrap=tk.WORD)
+        self.result_text_raw.pack(fill=tk.BOTH, expand=True)
+
+        self.result_listbox = tk.Listbox(self.tab_structured)
+        self.result_listbox.pack(fill=tk.BOTH, expand=True)
+        self.result_listbox.bind("<<ListboxSelect>>", self.on_listbox_select)
+
+        self.img_path = ""
+        self.img = None
+        self.tk_img = None
+        self.original_img = None  # 保存原始图片
+        self.original_img_size = (0, 0)  # 保存原始图片尺寸
+        self.current_width = 0
+        self.current_height = 0
+        self.drag_data = {"x": 0, "y": 0}
+        self.start_drag_x = 0
+        self.start_drag_y = 0
+        self.rectangles = []  # 存储显示位置矩形的引用
+
+        # Canvas绑定鼠标单击事件
+        self.canvas.bind("<Button-1>", self.on_canvas_click)
+
+    def select_image(self):
+        self.img_path = filedialog.askopenfilename(initialdir="/", title="Select Image File",
+                                                   filetypes=(("JPEG files", "*.jpg"), ("PNG files", "*.png"),
+                                                              ("All files", "*.*")))
+        if self.img_path:
+            self.load_image()
+
+    def load_image(self):
+        self.img = Image.open(self.img_path)
+        self.original_img = self.img.copy()  # Save original image
+        self.original_img_size = self.original_img.size  # Save original image size
+
+        # Display the image directly without resizing
+        self.display_image(self.original_img)
+
+        # Clear any existing rectangles on canvas
+        self.canvas.delete("rectangle")
+        self.rectangles.clear()
+
+
+    def display_image(self, img):
+        self.canvas.delete("all")
+        self.tk_img = ImageTk.PhotoImage(img)
+        self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_img)
+        self.canvas.config(scrollregion=self.canvas.bbox(tk.ALL))
+
+    def resize_image(self, event=None):
+        if self.original_img:
+            # 获取窗口尺寸
+            width, height = self.preview_frame.winfo_width(), self.preview_frame.winfo_height()
+
+            # 获取原始图片尺寸
+            img_width, img_height = self.original_img_size
+
+            # 计算新的尺寸以保持宽高比
+            ratio = min(width / img_width, height / img_height)
+
+            # 计算新的图片尺寸
+            new_width = int(img_width * ratio)
+            new_height = int(img_height * ratio)
+
+            # 更新当前窗口显示的尺寸
+            self.current_width, self.current_height = new_width, new_height
+
+            # 根据当前显示比例重新调整图片大小
+            resized_img = self.original_img.resize((new_width, new_height), Image.LANCZOS)
+            self.display_image(resized_img)
+
+            # 重新显示位置矩形框
+            self.display_rectangles()
+
+
+    def analyze_image(self):
+        if not self.img_path:
+            messagebox.showerror("Error", "No image selected.")
+            return
+        
+        try:
+            with open(self.img_path, "rb") as img_file:
+                base64img = base64.b64encode(img_file.read()).decode("utf-8")
+
+            url = "http://61.149.143.246:81/ysweb/v2/ocr/ft"
+            key = "YstestGuoCui"
+            privateKey = "683b295ec214d019"
+            params = {"base64img": base64img}
+            
+            result = self.http_request(url, key, privateKey, params)
+            
+            # Display result
+            self.result_text_raw.delete(1.0, tk.END)
+            self.result_text_raw.insert(tk.END, json.dumps(result, ensure_ascii=False, indent=2))
+            self.display_structured_result(result)
+            
+            # 根据复选框勾选状态设置显示位置复选框
+            if self.show_position_var.get():
+                self.show_position_checkbox.select()
+            else:
+                self.show_position_checkbox.deselect()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"An error occurred: {str(e)}")
+
+    def http_request(self, ocr_url, user_key, user_pri_key, req_params):
+        timestamp = str(int(round(time.time() * 1000)))
+        sign_str = user_key + "&" + user_pri_key + "&" + timestamp
+        sign = hashlib.md5(sign_str.encode(encoding="UTF-8")).hexdigest()
+        headers = {
+            "key": user_key,
+            "timestamp": timestamp,
+            "sign": sign
+        }
+        data = dict()
+        for p in req_params.keys():
+            data[p] = req_params.get(p)
+        
+        response = requests.post(ocr_url, data=data, headers=headers)
+        return response.json()
+
+    def display_structured_result(self, result):
+        self.result_listbox.delete(0, tk.END)
+        self.canvas.delete("rectangle")
+        self.rectangles.clear()
+        
+        if result.get("code") == 0:
+            self.lines = result.get("data", {}).get("lines", [])
+            
+            # 获取图片方向信息
+            image_orientation = self.get_image_orientation()
+            
+            for index, line in enumerate(self.lines):
+                text = line.get("text", "")
+                self.result_listbox.insert(tk.END, f"{index + 1}: {text}")
+                
+                if self.show_position_var.get():
+                    coords = line.get("coords", [])
+                    
+                    # 根据图片方向调整坐标顺序
+                    if image_orientation >= 5:  # 图像需要旋转
+                        # 将坐标顺序调整为左上、右上、右下、左下
+                        coords = [coords[1], coords[0], coords[3], coords[2], coords[5], coords[4]]
+                    
+                    left = coords[0] * self.current_width / self.original_img.width
+                    top = coords[1] * self.current_height / self.original_img.height
+                    right = coords[2] * self.current_width / self.original_img.width
+                    bottom = coords[5] * self.current_height / self.original_img.height
+                    
+                    rect = self.canvas.create_rectangle(left, top, right, bottom, outline="green", width=2, tags=("rectangle",))
+                    self.rectangles.append(rect)
+        else:
+            self.result_listbox.insert(tk.END, f"Error: {result.get('message', 'Unknown error')}")
+
+    def get_image_orientation(self):
+        # 根据图片EXIF信息获取方向信息
+        try:
+            exif = self.img._getexif()
+            if exif:
+                orientation = exif.get(274, 1)
+                return orientation
+        except AttributeError:
+            pass
+        return 1  # 默认方向为正常
+
+
+    def toggle_show_position(self):
+        # 根据复选框勾选状态显示或隐藏位置矩形框
+        if self.show_position_var.get():
+            self.display_structured_result({"code": 0, "data": {"lines": self.lines}})
+        else:
+            # 清空显示位置的矩形框
+            self.canvas.delete("rectangle")
+            self.rectangles.clear()
+
+    def on_canvas_click(self, event):
+        if self.show_position_var.get():
+            self.toggle_rectangle_color(event)
+
+    def toggle_rectangle_color(self, event):
+        # 获取所有当前画布上的矩形对象
+        rectangles = self.canvas.find_withtag("rectangle")
+        
+        for rect in rectangles:
+            # 获取矩形的坐标
+            coords = self.canvas.coords(rect)
+            left, top, right, bottom = coords
+
+            # 检查鼠标事件是否发生在矩形内部
+            if left <= event.x <= right and top <= event.y <= bottom:
+                # 切换矩形颜色
+                current_color = self.canvas.itemcget(rect, "outline")
+                new_color = "red" if current_color == "green" else "green"
+                self.canvas.itemconfigure(rect, outline=new_color)
+
+                # 如果有选中的矩形框，且不是当前矩形框，则恢复为绿色
+                if self.selected_rectangle and self.selected_rectangle != rect:
+                    self.canvas.itemconfigure(self.selected_rectangle, outline="green")
+                
+                # 更新当前选中的矩形框
+                self.selected_rectangle = rect
+
+                # 获取当前矩形框对应的文本行索引
+                index = rectangles.index(rect)
+                if 0 <= index < len(self.lines):
+                    # 更新列表框中的选中项
+                    self.result_listbox.selection_clear(0, tk.END)
+                    self.result_listbox.selection_set(index)
+                    self.result_listbox.see(index)
+
+                    # 切换到结构化文本选项卡
+                    self.tab_control.select(self.tab_structured)
+
+                return  # 只处理最新点击的矩形框，因此可以直接返回
+
+    def on_listbox_select(self, event):
+        # Get selected index from Listbox
+        selected_index = self.result_listbox.curselection()
+        
+        if selected_index:
+            selected_index = int(selected_index[0])  # Get the first selected index
+            
+            # Update rectangle color on Canvas
+            rectangles = self.canvas.find_withtag("rectangle")
+            if 0 <= selected_index < len(rectangles):
+                # Restore previous selected rectangle to green
+                if self.selected_rectangle:
+                    self.canvas.itemconfigure(self.selected_rectangle, outline="green")
+                
+                # Highlight selected rectangle in red
+                rect = rectangles[selected_index]
+                self.canvas.itemconfigure(rect, outline="red")
+                self.selected_rectangle = rect
+                
+                # Scroll canvas to show selected rectangle
+                rect_coords = self.canvas.coords(rect)
+                if rect_coords:
+                    rect_center_x = (rect_coords[0] + rect_coords[2]) / 2
+                    rect_center_y = (rect_coords[1] + rect_coords[3]) / 2
+                    canvas_width = self.preview_frame.winfo_width()
+                    canvas_height = self.preview_frame.winfo_height()
+                    self.canvas.xview_moveto(max(0, rect_center_x / canvas_width - 0.5))
+                    self.canvas.yview_moveto(max(0, rect_center_y / canvas_height - 0.5))
+
+                # Switch to the structured text tab
+                self.tab_control.select(self.tab_structured)
+
+
+
+    def on_click_start_drag(self, event):
+        self.start_drag_x = event.x
+        self.start_drag_y = event.y
+
+    def on_drag(self, event):
+        delta_x = event.x - self.start_drag_x
+        delta_y = event.y - self.start_drag_y
+        self.canvas.scan_dragto(-delta_x, -delta_y, gain=1)
+        self.start_drag_x = event.x
+        self.start_drag_y = event.y
+
+    def on_release_drag(self, event):
+        pass
+
+    def display_rectangles(self):
+        # 显示位置矩形框
+        self.canvas.delete("rectangle")
+        
+        if self.show_position_var.get() and self.rectangles:
+            for rect in self.rectangles:
+                rect_coords = self.canvas.coords(rect)
+                if rect_coords:
+                    left, top, right, bottom = rect_coords
+                    new_left = left * self.current_width / self.original_img.width
+                    new_top = top * self.current_height / self.original_img.height
+                    new_right = right * self.current_width / self.original_img.width
+                    new_bottom = bottom * self.current_height / self.original_img.height
+                    
+                    # 创建新的矩形框并加入到画布中
+                    new_rect = self.canvas.create_rectangle(new_left, new_top, new_right, new_bottom, outline="green", width=2, tags=("rectangle",))
+                    self.rectangles[self.rectangles.index(rect)] = new_rect
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = OCRTesterApp(root)
+    root.mainloop()
